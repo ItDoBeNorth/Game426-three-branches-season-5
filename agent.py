@@ -10,6 +10,7 @@ in the morning and at midday, spends the evening at the inn, meets family at hom
 at staggered times. Greetings depend on the relationship and the time of day.
 """
 
+import difflib
 import heapq
 import math
 import re
@@ -276,6 +277,208 @@ _DEFAULT_BEDTIME = ("night", 0.25)  # any seat past the tenth
 _BED_REACH = 1.0  # metres from the spot this villager woke up in that counts as in bed
 _BED_STUCK_RANGE = 4.0  # stuck this close to bed (e.g. family in the way): sleep where we stand
 
+# Talking with the visitor (Season 5, after the course's "Conversations and Actions" guide). The
+# visitor types a menu number or a keyword; a question gets an answer from what the villager knows, a
+# request (show your work, take me home) is accepted or refused and, if accepted, becomes a temporary
+# goal that _assign runs as the "request" activity.
+_MESSAGE_CAP = 200  # characters per chat message (the environment's cap)
+_MENU = (
+    "Type a number or just ask: 1 What do you do? 2 Who are your family and coworkers? "
+    "3 Show me where you work. 4 Take me to your home. You can also ask where things are."
+)
+_MENU_MORE = "Say menu for more."  # ends an answer when the whole menu won't fit after it
+_MENU_HINT = " Say menu to talk."  # ends every greeting to the visitor
+# Places the visitor may ask about ("where is the inn?", "take me to the market"): the words that
+# name each, what to call it, and whose work it is. A villager shows the way only to its own
+# workplace or home; anywhere else it sends the visitor to whoever works there.
+_PLACES = {
+    "plot": ({"plot", "plots", "field", "fields", "farm", "farms", "crops", "garden", "gardens"}, "the plots", "farmer"),
+    "shrine": ({"shrine", "shrines", "temple"}, "the shrine", "shrine_keeper"),
+    "pump": ({"pump", "well", "water"}, "the pump", "wellkeeper"),
+    "stall": ({"stall", "stalls", "market", "shop", "shops", "store"}, "the market stalls", "stall_tender"),
+    "shed": ({"shed", "workshop", "repair"}, "the shed", "occupancy_tender"),
+    "bench": ({"bench", "benches"}, "the benches", "occupancy_tender"),
+    "lantern": ({"lantern", "lanterns", "lights", "lamp", "lamps"}, "the lanterns", "lighter"),
+    "bell": ({"bell"}, "the bell", "lighter"),
+    "hearth": ({"hearth", "fire", "fireplace"}, "the inn hearth", "lighter"),
+    "inn": ({"inn", "tavern", "pub"}, "the inn", "building_wanderer"),
+    "board": ({"board", "noticeboard"}, "the board", "building_wanderer"),
+}
+# Where each role says it works ("Where do you work?"); the distance is to its "show me" goal
+_WORKPLACE_NAMES = {
+    "farmer": "the plots",
+    "shrine_keeper": "the shrine",
+    "wellkeeper": "the pump",
+    "stall_tender": "the market stalls",
+    "occupancy_tender": "the repair bench in the shed",
+    "lighter": "the bell, and every lantern in the village",
+    "building_wanderer": "the buildings around the village, mostly the inn",
+}
+# Words naming a role ("where are the farmers?"); the two-word ones are checked in Conversation.intent
+_ROLE_WORDS = {
+    "farmer": "farmer",
+    "farmers": "farmer",
+    "wellkeeper": "wellkeeper",
+    "lighter": "lighter",
+    "lamplighter": "lighter",
+    "wanderer": "building_wanderer",
+    "guide": "building_wanderer",
+}
+_TALK_TICKS = 20  # after the visitor's last message, stand facing them this long (unless busy)
+_BROADCAST_FACING_DEGREES = 30.0  # a message to everyone is answered by whoever the visitor faces this closely
+_REQUEST_WALK_LIMIT = 400  # ticks to get there (waits for the visitor included) before giving up
+_REQUEST_WAIT_TICKS = 40  # time spent there with the visitor before going back to the day
+_REQUEST_REACH = 2.0  # metres from the goal that counts as there
+_REQUEST_SOON_TICKS = 60  # family evening or bedtime this close: refuse rather than be cut short
+# A guide keeps the visitor close: full pace with them within _GUIDE_NEAR, slower out to _GUIDE_FAR,
+# and beyond that it stops, turns back and waits. Waiting this long in a row (they stayed put or
+# wandered off): give up.
+_GUIDE_NEAR = 2.5  # metres
+_GUIDE_FAR = 4.0  # metres
+_GUIDE_SLOW_SPEED = 0.5  # fraction of walking speed while the visitor lags a little
+_GUIDE_LOST_TICKS = 60
+_GUIDE_BACK_LINE = "OK, heading back to {} now. Goodbye!"  # the visitor went the other way, or stopped following
+_GUIDE_TURNED_BACK = 4.0  # metres farther from the goal than they've been: they're going the other way
+# Goodbyes must be said while the visitor can still hear them (chat only reaches 6 m): once a visitor
+# walking away is this far off, still in earshot, the villager says goodbye then. During a walk, they
+# must also have turned back (this much farther from the goal than they've been).
+_FAREWELL_GAP = 4.5  # metres
+_FAREWELL_TURN = 1.5  # metres
+_FOLLOW_ME = "Follow me!"  # every walk starts with this
+# Places every villager knows and will walk the visitor to, whoever works there (keys of _PLACES),
+# with what the walk heads for: the nearest prop of a type, or just outside a building's doorway
+_SHARED_PLACES = {"inn": ("doorway", "inn"), "stall": ("prop", "stall"), "pump": ("prop", "pump")}
+# "*thinking*" first for answers that take some working out (where things are, walks); the real
+# answer follows this many ticks later
+_THINKING = "*thinking*"
+_THINK_TICKS = 4
+_THINK_INTENTS = (
+    "where_work", "where_home", "where_place", "where_role", "where_family", "show_work", "take_home", "take_place",
+)
+# Refusals that are about work open with "Sorry, I'm busy." and the role's own busy line
+_WORK_REFUSALS = ("bell", "patrol", "lights", "duty", "moment", "not_idle")
+_BUSY_LINE = "Sorry, I'm busy."
+# Where "show me your work" leads, by role: the nearest prop of a type, or just outside a building
+_WORKPLACES = {
+    "farmer": ("prop", "plot"),
+    "shrine_keeper": ("prop", "shrine"),
+    "wellkeeper": ("prop", "pump"),
+    "stall_tender": ("prop", "stall"),
+    "occupancy_tender": ("prop", "repair_bench"),
+    "lighter": ("prop", "bell"),
+    "building_wanderer": ("doorway", "inn"),
+}
+# Each role's voice. "work" and "coworkers" answer menu items 1 and 2 (a live fact and the housemate
+# are added on); "day" answers small talk like "How is your day?"; "show_*"/"home_*" accept a
+# request and speak on arrival; "busy" opens a refusal; "bye" ends a walk.
+_PERSONAS = {
+    "farmer": {
+        "work": "I grow the village's food on the five plots. Proud of every row!",
+        "coworkers": "The other farmer shares the plots with me. The stall tenders sell what we grow, and the wellkeeper's water keeps it growing.",
+        "day": "Muddy, but good!",
+        "show_ok": "I'll show you my plot. Mind the mud.",
+        "show_here": "Here's my plot. Fields are slow going, but worth it.",
+        "home_ok": "Home's this way.",
+        "home_here": "This is my home.",
+        "busy": "The plots won't tend themselves!",
+        "bye": "Off you go then. Back to the plots!",
+    },
+    "shrine_keeper": {
+        "work": "I keep the shrines tended, so the village stays calm and blessed.",
+        "coworkers": "The other shrine keeper and the wellkeeper are my coworkers. We meet at a shrine in the morning and the well at midday.",
+        "day": "Peaceful, thank you.",
+        "show_ok": "Quietly, please. The shrine is this way.",
+        "show_here": "This is the shrine. Please speak softly here.",
+        "home_ok": "Very well, home is this way.",
+        "home_here": "This is my home.",
+        "busy": "Forgive me, my duties come first.",
+        "bye": "Go in peace.",
+    },
+    "wellkeeper": {
+        "work": "I keep the village pump flowing. Everyone needs water, the farmers most of all.",
+        "coworkers": "The shrine keepers are my coworkers. The farmers need my water most, so ask them about their plots.",
+        "day": "Steady, like the pump.",
+        "show_ok": "The pump's this way.",
+        "show_here": "Here's the pump. A few strokes and the water flows.",
+        "home_ok": "Alright, it's this way.",
+        "home_here": "This is home.",
+        "busy": "Water first, visits later.",
+        "bye": "Right then, back to the pump.",
+    },
+    "stall_tender": {
+        "work": "I open the market stalls and keep them busy. Best goods in Three Branches!",
+        "coworkers": "The other stall tender keeps the market with me. The farmers grow what we sell, go ask them!",
+        "day": "Business is good!",
+        "show_ok": "Right this way to the stalls! Don't be shy.",
+        "show_here": "Here's my stall! Have a good look around.",
+        "home_ok": "Home's just this way!",
+        "home_here": "Here's my home.",
+        "busy": "The stalls need me right now!",
+        "bye": "Come back and buy something!",
+    },
+    "occupancy_tender": {
+        "work": "I fix things at the repair bench in the shed. In the evening the inn bench is mine.",
+        "coworkers": "The building wanderer and I look after the town's buildings. Everyone ends up at the inn in the evening.",
+        "day": "Easy going, as always.",
+        "show_ok": "The shed's this way.",
+        "show_here": "This is the shed and my repair bench.",
+        "home_ok": "Sure thing, it's this way.",
+        "home_here": "This is my place.",
+        "busy": "Bit busy right now, sorry.",
+        "bye": "See you around!",
+    },
+    "lighter": {
+        "work": "*yawn* I ring the dawn bell and light every lantern and the inn hearth. Night is my shift.",
+        "coworkers": "I work alone, at night, while the rest of the village sleeps.",
+        "day": "*yawn* Long. My day starts when yours ends.",
+        "show_ok": "*yawn* Fine, the bell's this way.",
+        "show_here": "This is the bell. I ring it at dawn to wake everyone.",
+        "home_ok": "*yawn* Fine, I could use the rest anyway.",
+        "home_here": "This is home. I barely see it by daylight.",
+        "busy": "Lanterns don't light themselves.",
+        "bye": "Good. Back to my lanterns.",
+    },
+    "building_wanderer": {
+        "work": "I wander between the buildings and show people around. I know every door in the village!",
+        "coworkers": "The occupancy tender is my coworker, but honestly, I know everyone here!",
+        "day": "Wonderful, as always!",
+        "show_ok": "With pleasure! My work starts at the inn.",
+        "show_here": "Here's the inn, where everyone gathers in the evening!",
+        "home_ok": "Of course, it's this way!",
+        "home_here": "This is my home!",
+        "busy": "Oh, I'd love to, but not right now.",
+        "bye": "It was a pleasure!",
+    },
+}
+# Why a request is refused (said after the role's "busy" line; a sleeper just says "Zzz...")
+_REFUSALS = {
+    "waking": "I'm still getting up. Ask me in a moment.",
+    "bell": "I have to ring the dawn bell!",
+    "bed": "It's late, I'm off to bed. Ask me tomorrow.",
+    "family": "I'm with my family now. Ask me another time.",
+    "family_soon": "My family expects me home soon. Ask me another time.",
+    "night": "It's night. Ask me during the day.",
+    "patrol": "It's my night watch. Ask me tomorrow.",
+    "lights": "I have lights to light. Ask me once they're all lit.",
+    "duty": "I have my evening duties first. Ask me at the inn later.",
+    "moment": "Ask me again in a moment.",
+    "not_idle": "I still have work to do. Ask me this evening.",
+    "busy_walk": "I'm already showing you something.",
+}
+_LOST_LINE = "Sorry, I can't find the way there."
+_FAMILY_CALL_LINE = "Sorry, my family is expecting me now. Goodbye!"  # family evening cuts a walk short
+_BEDTIME_LINE = "Sorry, it's late and I must get to bed. Good night!"  # so does bedtime
+# What a role's work count is called in its "What I do" answer: prop types counted, and the phrase
+# role -> (prop types counted, line for one, line for several, line for none yet)
+_WORK_FACTS = {
+    "farmer": (("plot",), "I've tended one plot today.", "I've tended {n} plots today.", "I haven't tended a plot yet today."),
+    "shrine_keeper": (("shrine",), "I've tended a shrine once today.", "I've tended the shrines {n} times today.", "I haven't tended a shrine yet today."),
+    "wellkeeper": (("pump",), "I've worked the pump once today.", "I've worked the pump {n} times today.", "I haven't worked the pump yet today."),
+    "occupancy_tender": (("repair_bench", "bench"), "I've had one turn at the benches today.", "I've had {n} turns at the benches today.", "No bench work yet today."),
+    "lighter": (("lantern", "hearth"), "I've lit one light today.", "I've lit {n} lights today.", "No lights lit yet today."),
+    "building_wanderer": (("doorway",), "I've called at one doorway today.", "I've called at {n} doorways today.", "I'm just getting started today."),
+}
+
 
 def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
     """Return the point at the centre of one village cell."""
@@ -523,6 +726,145 @@ def _astar_path(observation, caches, start_cell, dest_cell):
     return None
 
 
+def _fit(text: str, extra: str = "") -> str:
+    """A chat line within the message cap: ``extra`` (say, the menu) is added only if it fits; the
+    menu that doesn't fit becomes the short "Say menu for more." """
+    for tail in (extra, _MENU_MORE if extra == _MENU else ""):
+        if tail and len(text) + 1 + len(tail) <= _MESSAGE_CAP:
+            return text + " " + tail
+    return text[:_MESSAGE_CAP]
+
+
+class Conversation:
+    """One villager's talk with the visitor: who it's with, when they last spoke, and what was said.
+    It also reads a message as an intent: a menu number, or the same thing asked in the visitor's
+    own words (keywords, with small typos forgiven)."""
+
+    _NUMBERS = {"1": "work", "2": "coworkers", "3": "show_work", "4": "take_home"}
+    _MENU_WORDS = {"0", "menu", "help", "options"}
+    # Keywords, checked in the order intent() lists. A request needs a verb ("show me where you work",
+    # "take me to your house"); "where ..." without one is a question ("where do you work?").
+    _END_WORDS = {"thanks", "thank", "bye", "goodbye", "stop", "cancel", "enough"}
+    _REQUEST_VERBS = {"show", "take", "lead", "bring", "walk", "guide", "come", "see", "visit"}
+    _WHERE_WORDS = {"where", "find", "located", "location"}
+    _WORK_WORDS = {
+        "work", "works", "job", "jobs", "workplace", "working", "occupation", "profession", "trade",
+        "career", "duty", "duties", "task", "tasks", "busy",
+    }
+    _HOME_WORDS = {"home", "live", "lives", "house"}
+    _FAMILY_WORDS = {
+        "family", "housemate", "wife", "husband", "partner", "married", "kids", "children", "child", "son",
+        "daughter", "parents", "mother", "father", "mom", "dad", "brother", "sister", "relatives",
+    }
+    _PEOPLE_WORDS = _FAMILY_WORDS | {
+        "coworker", "coworkers", "colleague", "colleagues", "team", "friend", "friends", "neighbour",
+        "neighbours", "neighbor", "neighbors", "people", "villagers", "anyone", "everyone", "someone", "who",
+    }
+    _DOING_WORDS = {"do", "doing", "role"}
+    # Ordinary words a typo fix must never turn into a keyword ("were" is close to "where")
+    _NEVER_FIX = {
+        "were", "here", "there", "when", "what", "with", "have", "your", "from", "they", "them", "then",
+        "this", "that", "than", "their", "went", "want", "like", "just", "some", "more", "very", "been",
+        "does", "done", "good", "nice", "hello", "time", "today",
+    }
+    _vocab = None  # every keyword, built on first use, for the typo fix
+
+    @classmethod
+    def _words(cls, choice: str) -> set:
+        """The message's words, plus the keyword any small typo was meant to be ("famly" -> family)."""
+        if cls._vocab is None:
+            names = set().union(*(place[0] for place in _PLACES.values()))
+            cls._vocab = sorted(
+                cls._END_WORDS | cls._REQUEST_VERBS | cls._WHERE_WORDS | cls._WORK_WORDS | cls._HOME_WORDS
+                | cls._PEOPLE_WORDS | names | set(_ROLE_WORDS) | {"keeper", "tender", "occupancy"}
+            )
+        words = set(re.findall(r"[a-z]+", choice))
+        for word in list(words):
+            if len(word) >= 4 and word not in cls._NEVER_FIX and word not in cls._vocab:
+                words.update(difflib.get_close_matches(word, cls._vocab, n=1, cutoff=0.85))
+        return words
+
+    @staticmethod
+    def _role_named(words: set):
+        """The role a message names ("the farmers", "a shrine keeper"), or None."""
+        if words & {"keeper", "keepers"}:
+            return "wellkeeper" if words & {"well", "pump", "water"} else "shrine_keeper"
+        if words & {"tender", "tenders"}:
+            return "occupancy_tender" if words & {"occupancy", "bench", "benches"} else "stall_tender"
+        return next((_ROLE_WORDS[word] for word in words if word in _ROLE_WORDS), None)
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """The visitor left earshot: the next visit starts fresh."""
+        self.partner = None
+        self.last_tick = None
+        self.last_text = ""  # what the visitor last said to us
+        self.history = []  # [(their text, our reply)], the last few exchanges
+        self.zzz_said = False  # a sleeper mumbles once per visit, then stays quiet
+        self.farewell_said = False  # said goodbye as they walked off (once, unless they talk again)
+        self.last_pos = None  # where the visitor stood last tick, to tell when they walk away
+
+    def heard(self, partner: str, tick: int) -> None:
+        self.partner = partner
+        self.last_tick = tick
+        self.farewell_said = False
+
+    def remember(self, text: str, reply: str) -> None:
+        self.history = (self.history + [(text, reply)])[-3:]
+
+    @classmethod
+    def intent(cls, text: str):
+        """What the visitor is after, as (intent, about): a menu choice (work, coworkers, show_work,
+        take_home), a "where" question (where_work, where_home, where_place, where_role,
+        where_family, where_unknown), a walk somewhere else (take_place), end, menu, or unknown
+        (small talk, or something no rule covers). ``about`` names the place or role, if any."""
+        choice = text.strip().lower().rstrip(".!?")
+        if choice in cls._NUMBERS:
+            return cls._NUMBERS[choice], None
+        if choice in cls._MENU_WORDS:
+            return "menu", None
+        words = cls._words(choice)
+        if words & cls._END_WORDS:
+            return "end", None
+        place = next((key for key, (names, _, _) in _PLACES.items() if words & names), None)
+        role = cls._role_named(words)
+        # A request: our home or our work, or somewhere else (answered by who to ask instead)
+        if words & cls._REQUEST_VERBS:
+            if words & cls._HOME_WORDS:
+                return "take_home", None
+            if words & cls._WORK_WORDS:
+                return "show_work", None
+            if place is not None:
+                return "take_place", place
+            if role is not None:
+                return "take_place", next(key for key, (_, _, owner) in _PLACES.items() if owner == role)
+            if "place" in words:
+                return "take_home", None  # "take me to your place"
+        # A "where" question: answered, never walked
+        if words & cls._WHERE_WORDS:
+            if role is not None:
+                return "where_role", role
+            if words & cls._WORK_WORDS:
+                return "where_work", None
+            if words & cls._HOME_WORDS and "who" not in words:
+                return "where_home", None
+            if place is not None:
+                return "where_place", place
+            if words & cls._FAMILY_WORDS:
+                return "where_family", None
+            if not words & cls._PEOPLE_WORDS:
+                return "where_unknown", None
+        if words & cls._PEOPLE_WORDS:
+            return "coworkers", None  # "who do you live with" lands here too
+        if words & cls._HOME_WORDS:
+            return "where_home", None
+        if role is not None or words & (cls._WORK_WORDS | cls._DOING_WORDS) or "up to" in choice:
+            return "work", None  # "are you a farmer?", "what are you up to?"
+        return "unknown", None
+
+
 class Agent:
     """One villager living by the day's schedule (see the module docstring), reacting to people it sees."""
 
@@ -613,6 +955,14 @@ class Agent:
 
         # Messages queued by act() for chat(), which the harness calls later the same tick
         self._outbox = []
+
+        # Talking with the visitor (Season 5): chat() has no observation of its own, so it reads the
+        # one act() saw this tick. The conversation and any accepted request live across ticks.
+        self._latest = observation
+        self.conversation = Conversation()
+        self.request = None  # {"kind", "id", "goal", "since", "stage", ...} while doing what the visitor asked
+        self._thinking = None  # {"due", "text", "intent", "about"}: an answer after "*thinking*"
+        self.work_done = {}  # {prop type (or "doorway"): times finished today}, for "What I do"
 
     def _prop_use_ticks(self, prop_type: str) -> int:
         """How many ticks to hold "use" on a prop, based on its catalog transition type."""
@@ -941,6 +1291,7 @@ class Agent:
 
         target_pos = self.role_target["position"]
         if geometry.distance(here, target_pos) <= 2.0:
+            self.work_done["doorway"] = self.work_done.get("doorway", 0) + 1
             self.role_target = None
             self.hop_point = None
             return action.stand(heading, "sweep")
@@ -1119,7 +1470,7 @@ class Agent:
             self.news_told.add(player_id)
             text += _VISITOR_NEWS[news[0]]
         if kind == "visitor":
-            text += _VISITOR_EXTRA_LINES.get(self.role, "")
+            text += _VISITOR_EXTRA_LINES.get(self.role, "") + _MENU_HINT
         return text
 
     def _reply_text(self, kind: str, tick: int) -> str:
@@ -1597,6 +1948,8 @@ class Agent:
 
         if self.active_task is not None:
             if self.use_counter >= self.active_task["ticks_remaining"]:
+                done_type = self.active_task["type"]
+                self.work_done[done_type] = self.work_done.get(done_type, 0) + 1
                 # Back in the pool once it reverts (timed) or the time of day flips it (toggles)
                 self._mark_done(
                     self.active_task["prop_id"], self.active_task["type"], day.tick(observation), _phase(observation)
@@ -1675,6 +2028,7 @@ class Agent:
         """Choose this tick's action, adding a wave if we greeted a friend on the move."""
         self._passing_emote = None
         observation = {**observation, "village": self._village}  # the day's one copy of the map (see reset)
+        self._latest = observation  # chat() answers the visitor from what we see this tick
         chosen = self._decide(observation)
         if self._passing_emote is not None and int(chosen["action"]) == 0:
             return action.walk(float(chosen["heading"]), float(chosen["speed"]), self._passing_emote)
@@ -1689,6 +2043,12 @@ class Agent:
         self._nearby_ids = {person["id"] for person in people.nearby(observation)}  # in earshot this tick
         for seen_prop in props.seen(observation):
             self.prop_memory[seen_prop["prop"]] = (seen_prop["state"], tick)
+        if self.conversation.partner is not None and self.conversation.partner not in self._nearby_ids:
+            self.conversation.reset()  # the visitor walked off: a later visit starts fresh
+        elif self.conversation.partner is not None:
+            self._farewell(observation, here)
+        elif "player_0" not in self._nearby_ids:
+            self.conversation.zzz_said = False
 
         # A toggle hold finishes first whatever the clock says; switching mid-hold would flip it back
         mid_toggle = self._mid_toggle()
@@ -1725,7 +2085,7 @@ class Agent:
         # the inn, or a toggle round (stalls, lights) -- greetings happen on the move so the trip
         # doesn't stall; once there, people stop and greet properly
         self._hurrying = (
-            activity == "sleep"
+            activity in ("sleep", "request")
             or (activity == "family" and self.family_evening is not None and self.family_evening["stage"] == "going")
             or (
                 activity == "gather"
@@ -1736,6 +2096,9 @@ class Agent:
             or (self.role_target is not None and self.role_target["type"] in _URGENT_TYPES)
         )
         if not mid_toggle:
+            talking = self._talk_tick(observation, activity, here, tick)
+            if talking is not None:
+                return talking
             reaction = self._react_to_people(observation)
             if reaction is not None:
                 return reaction
@@ -1743,6 +2106,8 @@ class Agent:
             if following is not None:
                 return following
 
+        if activity == "request":
+            return self._request_tick(observation, heading, here, tick)
         if activity == "family":
             return self._family_evening_tick(observation, heading, here, tick)
         if activity == "sleep":
@@ -1754,6 +2119,40 @@ class Agent:
         if activity == "social":
             return self._social_tick(observation, heading, here, tick)
         return self._task_tick(observation, heading, here)
+
+    def _farewell(self, observation: ThreeBranchesObservation, here) -> None:
+        """The visitor we've been talking with is walking away: say goodbye once while they can still
+        hear it. Only their own steps count (we may be walking too), and a walk we're guiding has its
+        own goodbye (see _request_tick)."""
+        talk = self.conversation
+        visitor = people.find(observation, talk.partner)
+        if visitor is None or self.request is not None or talk.farewell_said or self._sleeping():
+            talk.last_pos = None
+            return
+        previous, talk.last_pos = talk.last_pos, visitor["position"]
+        gap = geometry.distance(here, visitor["position"])
+        if previous is not None and gap >= _FAREWELL_GAP and gap > geometry.distance(here, previous) + 0.1:
+            talk.farewell_said = True
+            self._outbox.append({"to": talk.partner, "text": f"Goodbye! {_PERSONAS[self.role]['bye']}", "reply": False})
+
+    def _talk_tick(self, observation: ThreeBranchesObservation, activity: str, here, tick: int):
+        """Talking with the visitor: stand facing them until they've been quiet for _TALK_TICKS.
+        Anyone on the clock (bell, bed, family, a toggle round, a walk the visitor asked for, the
+        trip to a gathering or the inn) keeps going and answers on the move instead."""
+        talk = self.conversation
+        if talk.partner is None or talk.last_tick is None or tick - talk.last_tick > _TALK_TICKS:
+            return None
+        if (
+            self._hurrying
+            or self.following is not None
+            or activity in ("request", "bell", "sleep", "family")
+            or (activity == "wake" and self.wake["stage"] != "up")
+        ):
+            return None
+        person = people.find(observation, talk.partner)
+        if person is None:
+            return None
+        return action.stand(geometry.heading_to(here, person["position"]), "none")
 
     def _follow_tick(self, observation: ThreeBranchesObservation, activity: str, here, tick: int):
         """The building wanderer walking along with the visitor after greeting them, like a guide,
@@ -1772,6 +2171,11 @@ class Agent:
 
     def _assign(self, observation: ThreeBranchesObservation) -> str:
         """This tick's activity; the first rule that matches wins."""
+        if self.request is not None:  # the visitor's walk can't hold up family or bed
+            if self.family_evening is not None or self._family_evening_due(observation):
+                self._end_request(_FAMILY_CALL_LINE)
+            elif _reached(observation, self.bedtime):
+                self._end_request(_BEDTIME_LINE)
         if self.family_evening is not None or self._family_evening_due(observation):
             return "family"  # before bedtime, so a late family evening isn't cut short
         if _reached(observation, self.bedtime):
@@ -1780,6 +2184,8 @@ class Agent:
             return "bell"  # a bell trip still under way carries on past the end of dawn, to the deadline
         if self.activity == "wake" and self.wake["stage"] != "up":
             return "wake"  # still getting up (a late bell, the muster) carries on past the end of dawn
+        if self.request is not None:
+            return "request"  # showing the visitor something they asked to see (see _accept_request)
         phase = _phase(observation)
         activity = _SCHEDULES[self.role][_PHASE_NAMES.index(phase)]
         if activity == "wake" and self.wake["stage"] == "up":
@@ -1896,12 +2302,397 @@ class Agent:
                 return action.stand(heading, "sleep")
         return action.walk(walk_heading, 1.0, "none")
 
+    # --- Talking with the visitor (Season 5) -------------------------------------------------------
+
+    def _sleeping(self) -> bool:
+        """In bed: asleep for the night (or the lighter's morning), or not yet up at dawn."""
+        return self.asleep or (self.activity == "wake" and self.wake["stage"] in ("asleep", "stagger"))
+
+    def _housemate_line(self) -> str:
+        """Scripted knowledge: who shares this villager's home, by role."""
+        family = self._family()
+        if not family:
+            return ""
+        role = _role_of(family[0]).replace("_", " ")
+        return f"I live with the {role}."
+
+    def _work_fact(self) -> str:
+        """A live fact for "What I do": something seen right now, or remembered from today."""
+        observation = self._latest
+        if self.role == "stall_tender":
+            stalls = [prop["id"] for prop in props.all(observation) if prop["type"] == "stall"]
+            known = [self.prop_memory[stall][0] for stall in stalls if stall in self.prop_memory]
+            if known:
+                return f"{known.count('open')} of {len(stalls)} stalls were open when I last looked."
+            return "I haven't checked the stalls yet today."
+        if self.role == "shrine_keeper":
+            for seen in props.seen(observation):
+                prop = props.find(observation, seen["prop"])
+                if prop is not None and prop["type"] == "shrine":
+                    return f"The shrine over there is {seen['state']} right now."
+        facts = _WORK_FACTS.get(self.role)
+        if facts is None:
+            return ""
+        types, once, several, none_yet = facts
+        count = sum(self.work_done.get(prop_type, 0) for prop_type in types)
+        return none_yet if count == 0 else once if count == 1 else several.format(n=count)
+
+    def _how_far(self, kind: str, place: str | None = None) -> str:
+        """How far our workplace, our home or a shared place is from here, in words: "It's a short
+        walk from here, about 20 m." """
+        goal = self._request_goal(kind, place)
+        if goal is None:
+            return ""
+        metres = geometry.distance(me.position(self._latest), goal["point"])
+        if metres < 12:
+            return "It's just nearby."
+        if metres < 40:
+            return f"It's a short walk from here, about {round(metres / 5) * 5} m."
+        return f"It's across the village, about {round(metres / 10) * 10} m away."
+
+    @staticmethod
+    def _someone_who(role: str) -> str:
+        """How to name one of a role: "a farmer" when there are two, "the wellkeeper" when one."""
+        name = role.replace("_", " ")
+        return f"a {name}" if _ROLE_ORDER.count(role) > 1 else f"the {name}"
+
+    def _where_role(self, role: str, tick: int) -> str:
+        """Where to find people of a role: where they work, and what this time of day changes."""
+        if role == self.role:
+            return f"That's me! I work at {_WORKPLACE_NAMES[role]}. Say 3 and I'll show you."
+        several = _ROLE_ORDER.count(role) > 1
+        name = role.replace("_", " ") + ("s" if several else "")
+        line = f"The {name} {'work' if several else 'works'} at {_WORKPLACE_NAMES[role]}."
+        phase = _phase_at_tick(tick)
+        if phase == "night" and role != "lighter":
+            return f"{line} At this hour they're most likely asleep at home."
+        if phase == "evening":
+            return f"{line} In the evening, though, most of us are at the inn."
+        if role == "lighter" and phase == "morning":
+            return f"{line} They sleep through the morning, though."
+        return f"{line} I'm not sure where they are right now."
+
+    def _answer(self, intent: str, tick: int, about=None) -> str:
+        """The reply to a question or a menu choice (requests go through _accept_request). ``about``
+        is the place or role a "where" question or a walk elsewhere names."""
+        persona = _PERSONAS[self.role]
+        if intent == "work":
+            return _fit(f"{persona['work']} {self._work_fact()}".strip(), _MENU)
+        if intent == "coworkers":
+            return _fit(f"{self._housemate_line()} {persona['coworkers']}".strip(), _MENU)
+        if intent == "menu":
+            return _MENU
+        if intent == "where_home":
+            family = self._family()
+            with_whom = f", with the {_role_of(family[0]).replace('_', ' ')}" if family else ""
+            return _fit(f"I live in one of the village homes{with_whom}. {self._how_far('take_home')} Say 4 and I'll take you there.")
+        if intent == "where_work" or (intent == "where_place" and _PLACES[about][2] == self.role):
+            return _fit(f"I work at {_WORKPLACE_NAMES[self.role]}. {self._how_far('show_work')} Say 3 and I'll show you.")
+        if intent in ("where_place", "take_place"):
+            _, name, owner = _PLACES[about]
+            if intent == "take_place" and owner == self.role:
+                return self._accept_request("show_work", tick)  # it's our own workplace: happily
+            if about in _SHARED_PLACES:
+                # The inn, the market and the well: everyone knows the way
+                if intent == "take_place":
+                    return self._accept_request("take_place", tick, about)
+                where = self._how_far("take_place", about).replace("It's", f"{name.capitalize()} {'are' if name.endswith('s') else 'is'}", 1)
+                return _fit(f"{where} Ask me to take you there if you like.", _MENU)
+            who = self._someone_who(owner)
+            if intent == "take_place":
+                return _fit(f"I can't take you to {name}. Ask {who}, they work there.", _MENU)
+            verb = "are" if name.endswith("s") else "is"
+            return _fit(f"I'm not sure exactly where {name} {verb}. Ask {who}, they work there.", _MENU)
+        if intent == "where_role":
+            return _fit(self._where_role(about, tick), _MENU)
+        if intent == "where_family":
+            family = self._family()
+            if not family:
+                return _fit("I live on my own. I'm not sure where anyone is right now.", _MENU)
+            return _fit(f"My family? {self._where_role(_role_of(family[0]), tick)}", _MENU)
+        if intent == "where_unknown":
+            return _fit("I'm not sure.", _MENU)
+        if intent == "end":
+            if self.request is not None:
+                self._end_request(None)
+                return persona["bye"]
+            said = self.conversation.last_text.lower()
+            return "You're welcome!" if "thank" in said else "Goodbye!" if "bye" in said else "All right."
+        if intent in ("show_work", "take_home"):
+            return self._accept_request(intent, tick)
+        # Anything else (a greeting, small talk, a question we have no answer for): a friendly word
+        # and the menu, so the visitor sees what to ask
+        words = _PHASE_WORDS[_phase_at_tick(tick)]
+        return _fit(f"{words['short']}! {persona['day']}", _MENU)
+
+    def _answers_broadcast(self, visitor, tick: int) -> bool:
+        """A message to everyone in earshot gets one answer: from whoever the visitor is already
+        talking with; else whoever the visitor is facing (within _BROADCAST_FACING_DEGREES), else
+        whoever is nearest. Every villager works this out from what it sees, so they agree."""
+        talk = self.conversation
+        if talk.partner == visitor["id"] and talk.last_tick is not None and tick - talk.last_tick <= _TALK_TICKS:
+            return True
+        observation = self._latest
+        sleeping = {person["id"] for person in people.seen(observation) if person["expression"]["type"] == "sleep"}
+        candidates = {self.player_id: me.position(observation)}
+        for person in (*people.seen(observation), *people.nearby(observation)):
+            if people.is_npc(person["id"]) and person["id"] not in sleeping:
+                candidates[person["id"]] = person["position"]
+        heading = visitor.get("heading")  # only a seen record has one
+
+        def rank(player_id: str):
+            spot = candidates[player_id]
+            if heading is not None:
+                gap = abs((float(heading) - geometry.heading_to(visitor["position"], spot) + 180.0) % 360.0 - 180.0)
+                if gap <= _BROADCAST_FACING_DEGREES:
+                    return (0, gap, _player_number(player_id))
+            return (1, geometry.distance(spot, visitor["position"]), _player_number(player_id))
+
+        return min(candidates, key=rank) == self.player_id
+
+    def _talk_to_visitor(self, message) -> str | None:
+        """The reply to one message from the visitor, or None to stay quiet."""
+        tick = int(message.get("tick", day.tick(self._latest)))
+        sender = message["from"]
+        visitor = people.find(self._latest, sender)
+        if visitor is None or sender not in self._nearby_ids:
+            return None  # out of earshot now: an answer couldn't reach them
+        if message.get("to") is None and not self._answers_broadcast(visitor, tick):
+            return None
+        if self._sleeping():
+            if self.conversation.zzz_said:
+                return None
+            self.conversation.zzz_said = True
+            return "Zzz..."
+        self.conversation.heard(sender, tick)
+        # Spoken to: that counts as this phase's exchange with the visitor, so no greeting on top of
+        # it (the wait restarts from now, whatever the last exchange was)
+        self._record_interaction(sender, tick, "them")
+        self.interactions[sender].update(since=tick, key=self._cooldown_key(sender, tick))
+        self.reply_due.pop(sender, None)
+        if self.pending_greet is not None and self.pending_greet["id"] == sender:
+            self.pending_greet = None
+        text = str(message.get("text", ""))
+        self.conversation.last_text = text
+        intent, about = Conversation.intent(text)
+        self._thinking = None  # a newer message replaces any answer still being thought over
+        already_walking = self.request is not None and intent in ("show_work", "take_home", "take_place")
+        if intent in _THINK_INTENTS and not already_walking:
+            # Takes some working out: say so now, answer a few ticks later (see _thought_reply)
+            self._thinking = {"due": day.tick(self._latest) + _THINK_TICKS, "text": text, "intent": intent, "about": about}
+            return _THINKING
+        reply = self._answer(intent, tick, about)
+        self.conversation.remember(text, reply)
+        return reply
+
+    def _thought_reply(self) -> str | None:
+        """The answer that followed "*thinking*", once it's due -- worked out now, from what we see
+        now -- or None (not due yet, nothing pending, or the visitor has gone or we've fallen asleep)."""
+        thinking = self._thinking
+        if thinking is None or day.tick(self._latest) < thinking["due"]:
+            return None
+        self._thinking = None
+        if "player_0" not in self._nearby_ids or self._sleeping():
+            return None
+        reply = self._answer(thinking["intent"], day.tick(self._latest), thinking["about"])
+        self.conversation.remember(thinking["text"], reply)
+        return reply
+
+    def _refusal(self, kind: str) -> str | None:
+        """Why this villager won't take the visitor somewhere right now (a key of _REFUSALS), or
+        None to accept. Role- and duty-aware: sleep, the bell, family and bedtime come first, then
+        night, the middle of a toggle, the lighter's rounds and evening duty; "take me home" also
+        needs nothing else to do (the evening at the inn, or no work left)."""
+        observation = self._latest
+        phase = _phase(observation)
+        activity = self.activity
+        if self.request is not None:
+            return "busy_walk"
+        if activity == "wake":
+            return "waking"
+        if activity == "bell":
+            return "bell"
+        if activity == "family":
+            return "family"
+        if activity == "sleep" or _reached(observation, self.bedtime):
+            return "bed"
+        # Don't take on a walk that family or bed would cut short straight away
+        soon = day.tick(observation) + _REQUEST_SOON_TICKS
+        if not self.family_evening_done and self._family() and _tick_at(self.family_time) <= soon:
+            return "family_soon"
+        if self.bedtime is not None and _tick_at(self.bedtime) <= soon:
+            return "bed"
+        if phase == "night":
+            return "patrol" if self.role == "lighter" else "night"
+        if self.active_task is not None:
+            return "moment"  # in the middle of a task (tending a plot, lighting a lantern...)
+        if self.role == "lighter" and activity in ("work", "patrol"):
+            return "lights"
+        if activity == "work" and phase == "evening":
+            return "duty"  # the evening's last round, closing stalls or lighting up, before the inn
+        if kind == "take_home" and not self._idle():
+            return "not_idle"
+        return None
+
+    def _idle(self) -> bool:
+        """Nothing else to do: the evening at the inn, or working with no prop of ours needing it."""
+        if self.activity == "social":
+            return True
+        if self.activity != "work":
+            return False
+        if self.role == "building_wanderer":
+            return True  # wandering *is* the job; it can wander home with the visitor
+        if self.active_task is not None or (self.role_target is not None and self.role_target["prop_id"] is not None):
+            return False
+        return not self._available_props(self._latest, _ROLE_TARGET_TYPES.get(self.role, ()))
+
+    def _request_goal(self, kind: str, place: str | None = None):
+        """Where a request leads -- {"point": standing spot, "look": what to point at} -- or None:
+        our home, our workplace, or one of the _SHARED_PLACES everyone knows."""
+        observation = self._latest
+        if kind == "take_home":
+            if self.home_doorway is None:
+                return None
+            return {"point": _outside_doorway(observation, self.home), "look": self.home_doorway}
+        where, what = _SHARED_PLACES[place] if kind == "take_place" else _WORKPLACES[self.role]
+        if where == "doorway":
+            building = next((item for item in layout.buildings(observation) if item["type"] == what), None)
+            door = layout.doorway(observation, building["id"]) if building is not None else None
+            if door is None:
+                return None
+            return {"point": _outside_doorway(observation, building["id"]), "look": door}
+        here = me.position(observation)
+        matching = [prop for prop in props.all(observation) if prop["type"] == what]
+        if (
+            kind == "show_work"
+            and self.role_target is not None
+            and self.role_target.get("type") == what
+            and self.role_target.get("prop_id")
+        ):
+            matching = [props.find(observation, self.role_target["prop_id"])]  # the one it was headed to
+        if not matching:
+            return None
+        prop = min(matching, key=lambda item: geometry.distance(here, _prop_centre(item)))
+        return {"point": _cell_centre(_nearest_walkable_cell(observation, prop["cell"])), "look": _prop_centre(prop)}
+
+    def _accept_request(self, kind: str, tick: int, place: str | None = None) -> str:
+        """Accept the visitor's request (it becomes the "request" activity from next tick) or refuse
+        it: "Follow me!" and the role's own line, or why not ("Sorry, I'm busy." first if it's work)."""
+        persona = _PERSONAS[self.role]
+        reason = self._refusal(kind)
+        if reason is not None:
+            if reason in _WORK_REFUSALS:
+                return _fit(f"{_BUSY_LINE} {persona['busy']} {_REFUSALS[reason]}")
+            return _fit(_REFUSALS[reason])
+        goal = self._request_goal(kind, place)
+        if goal is None:
+            return _LOST_LINE
+        self.following = None
+        self.request = {
+            "kind": kind,
+            "place": place,
+            "id": "player_0",
+            "goal": goal["point"],
+            "look": goal["look"],
+            "since": tick,
+            "stage": "going",
+            "waiting": 0,  # ticks in a row stopped for the visitor (too far behind, or out of sight)
+            "last_seen": None,
+            "closest": None,  # the visitor's nearest approach to the goal so far
+            "back_to": "the inn" if self.activity == "social" else "work",  # where we go afterwards
+        }
+        if kind == "take_place":
+            line = f"{_PLACES[place][1].capitalize()} {'are' if _PLACES[place][1].endswith('s') else 'is'} this way."
+        else:
+            line = persona["show_ok" if kind == "show_work" else "home_ok"]
+        return f"{_FOLLOW_ME} {line}"
+
+    def _end_request(self, line: str | None) -> None:
+        """Back to the normal day, saying ``line`` to the visitor if they're still in earshot."""
+        if line and "player_0" in self._nearby_ids:
+            self._outbox.append({"to": "player_0", "text": line, "reply": False})
+        self.request = None
+        self._path = None
+
+    def _request_tick(self, observation: ThreeBranchesObservation, heading: float, here, tick: int):
+        """Walk the visitor to the goal, keeping them close: full pace with them within _GUIDE_NEAR,
+        slower out to _GUIDE_FAR, and stopped (turned back toward them, waving now and then) beyond
+        that. Then point it out and stay _REQUEST_WAIT_TICKS before going back to the day. A walk
+        that can't be found, takes too long, or loses the visitor altogether is given up."""
+        req = self.request
+        persona = _PERSONAS[self.role]
+        visitor = people.find(observation, req["id"])
+        back_line = _GUIDE_BACK_LINE.format(req["back_to"])
+        if visitor is not None:
+            req["last_seen"] = visitor["position"]
+        if req["stage"] == "going":
+            if tick - req["since"] > _REQUEST_WALK_LIMIT:
+                self._end_request(_LOST_LINE)
+                return action.stand(heading, "shrug")
+            if geometry.distance(here, req["goal"]) <= _REQUEST_REACH:
+                req["stage"], req["arrived"] = "there", tick
+                if req["kind"] == "take_place":
+                    _, name, owner = _PLACES[req["place"]]
+                    several = _ROLE_ORDER.count(owner) > 1
+                    workers = owner.replace("_", " ") + ("s work" if several else " works")
+                    line = f"{'Here are' if name.endswith('s') else 'Here is'} {name}. The {workers} here.".replace("Here is", "Here's")
+                else:
+                    line = persona["show_here" if req["kind"] == "show_work" else "home_here"]
+                if req["kind"] == "take_home":
+                    line = _fit(f"{line} {self._housemate_line().replace('I live with', 'I share it with')}".strip())
+                self._say(req["id"], line, self._nearby_ids)
+                return action.stand(geometry.heading_to(here, req["look"]), "point")
+            gap = geometry.distance(here, visitor["position"]) if visitor is not None else math.inf
+            if visitor is not None:
+                # Heading the other way: they've got farther from the goal than they've been. Say
+                # goodbye as they go, while they can still hear it; or, missing that, once clearly gone.
+                to_goal = geometry.distance(visitor["position"], req["goal"])
+                req["closest"] = to_goal if req["closest"] is None else min(req["closest"], to_goal)
+                leaving_earshot = req["id"] in self._nearby_ids and gap >= _FAREWELL_GAP
+                if (leaving_earshot and to_goal > req["closest"] + _FAREWELL_TURN) or to_goal > req["closest"] + _GUIDE_TURNED_BACK:
+                    self._end_request(back_line)
+                    return action.stand(geometry.heading_to(here, visitor["position"]), "wave")
+            if gap > _GUIDE_FAR:
+                # They've fallen behind (or out of view): stop and look back for them, with a wave,
+                # but not forever -- someone who stays put has changed their mind
+                req["waiting"] += 1
+                if req["waiting"] >= _GUIDE_LOST_TICKS:
+                    self._end_request(back_line)
+                    return action.stand(heading, "shrug")
+                back = req["last_seen"]
+                facing = geometry.heading_to(here, back) if back is not None else heading
+                return action.stand(facing, "wave" if (tick - req["since"]) % 15 == 0 else "none")
+            req["waiting"] = 0
+            walk_heading = self._walk_toward(req["goal"], observation)
+            if self._walk_failed:
+                self._walk_failed = False
+                self._end_request(_LOST_LINE)
+                return action.stand(heading, "shrug")
+            return action.walk(walk_heading, 1.0 if gap <= _GUIDE_NEAR else _GUIDE_SLOW_SPEED, "none")
+        if tick - req["arrived"] >= _REQUEST_WAIT_TICKS:
+            self._end_request(persona["bye"])
+            return action.stand(heading, "wave")
+        facing = geometry.heading_to(here, visitor["position"] if visitor is not None else req["look"])
+        return action.stand(facing, "none")
+
     # Optional: messaging. On your turn, chat receives messages addressed to your player since
     # its previous turn. Return messages with a recipient and text, or nothing to stay silent.
     # Use None as the recipient to broadcast. Every message is recorded and shown in replays.
     #
     def chat(self, inbox: list[dict]) -> list[dict] | None:
-        """Note task claims from other villagers, then send every message act() queued."""
+        """Answer the visitor, note task claims from other villagers, then send what act() queued."""
+        # The visitor's newest message to us (or to everyone in earshot) gets an answer; it goes out
+        # ahead of anything act() queued for them, since the harness takes one message per recipient
+        reply = None
+        for message in reversed(inbox or ()):
+            if message.get("from") == "player_0" and message.get("to") in (None, self.player_id):
+                reply = self._talk_to_visitor(message)
+                break
+        if reply is None:
+            reply = self._thought_reply()  # the answer after an earlier "*thinking*", once it's due
+        if reply is not None:
+            self._outbox = [entry for entry in self._outbox if entry["to"] != "player_0"]
+            self._outbox.insert(0, {"to": "player_0", "text": reply[:_MESSAGE_CAP], "reply": True})
         for message in inbox or ():
             sender = message.get("from")
             if not isinstance(sender, str) or not people.is_npc(sender):
@@ -1915,8 +2706,8 @@ class Agent:
                 del self.claims[released.group(1)]
         for message in inbox or ():
             sender = message.get("from")
-            if not isinstance(sender, str) or message.get("to") != self.player_id:
-                continue
+            if not isinstance(sender, str) or message.get("to") != self.player_id or people.is_visitor(sender):
+                continue  # the visitor's messages are answered above
             text = str(message.get("text", ""))
             if _CLAIM_PATTERN.fullmatch(text) or _RELEASE_PATTERN.fullmatch(text):
                 continue
