@@ -1,4 +1,4 @@
-# Days at Three Branches agent
+# Days at Three Branches(The Conversation) agent
 
 Edit `agent.py` to give every one of your villagers a routine. The platform runs a separate `Agent` instance for each NPC, so instances do not share variables or memory. The supplied `sandbox/` directory contains the local runner, types, and village helpers. Leave it unchanged, and leave `requirements.in` and `requirements.txt` alone: the pinned packages match the server.
 
@@ -39,3 +39,11 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+
+## Reflection
+Season 5: To refine conversations, I chose to update the agent with the 'conversations and actions' lesson. I gave villagers personalities for unique responses and actions, and the ability to understand open-ended conversations through keywords and a simple conversation menu. This all evolves from my existing dialogue work. This time, the visitor can have more customised conversations with the villager, asking about work, family, and where things are. The villager can now also be asked to lead the visitor to certain places like their work, home, and common meeting spots. The villager refuses or directs the visitor to someone else if they are busy or don't know where something is. I decided to do all this without LLMs because I found little use for one. The agent is able to handle a good amount of questions and conversations led by keywords, roles, personalities, and what they see/know. Villagers react to each other and visitors as always. 
+
+## AI Use Disclosure and Reflection
+I used Claude Code in VS Code. It coded all of this based on my pseudocode and instructions. I verified sets of code it wrote before approving it, reverted and asked for changes as needed, tested by watching and eval, and discussed my ideas for solutions before committing to one. I did not write any code directly, but watched what Claude was doing to check it. I had it set to ask for approval before committing anything, and that worked especially during testing and understanding what code was being changed. Planning mode helped a lot, and I was able to go through each step slowly to understand what's going on. However, Claude has started to run more complicated commands I don't understand in order to read my older code and test. It might get too fast for me to understand whats going on most of the time. The code has gotten quite complicated as well. 
+
