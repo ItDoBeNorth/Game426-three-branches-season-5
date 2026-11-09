@@ -284,8 +284,21 @@ _BED_STUCK_RANGE = 4.0  # stuck this close to bed (e.g. family in the way): slee
 _MESSAGE_CAP = 200  # characters per chat message (the environment's cap)
 _MENU = (
     "Type a number or just ask: 1 What do you do? 2 Who are your family and coworkers? "
-    "3 Show me where you work. 4 Take me to your home. You can also ask where things are."
+    "3 Show me where you work. 4 Take me to your home. You can also ask where things are, or if they're lit or open."
 )
+# "Is the lantern lit?", "are the stalls open?": words that ask about a prop's state, and the prop
+# type each _PLACES key has a state for (inn, shed and board have none). The answer comes from what
+# the villager can see right now; anything out of view is "can't see it" plus what it remembers.
+_STATE_WORDS = {
+    "lit", "unlit", "light", "burning", "open", "opened", "closed", "shut", "tended", "untended",
+    "overgrown", "weeded", "ringing", "quiet", "silent", "flowing", "running", "pumping", "working",
+    "occupied", "empty", "free", "taken", "state", "status",
+}
+_STATE_TYPES = {
+    "plot": "plot", "shrine": "shrine", "pump": "pump", "stall": "stall", "lantern": "lantern",
+    "bell": "bell", "hearth": "hearth", "bench": "bench",
+}
+_PLURALS = {"bench": "benches"}  # anything else just takes an "s"
 _MENU_MORE = "Say menu for more."  # ends an answer when the whole menu won't fit after it
 _MENU_HINT = " Say menu to talk."  # ends every greeting to the visitor
 # Places the visitor may ask about ("where is the inn?", "take me to the market"): the words that
@@ -776,7 +789,7 @@ class Conversation:
             names = set().union(*(place[0] for place in _PLACES.values()))
             cls._vocab = sorted(
                 cls._END_WORDS | cls._REQUEST_VERBS | cls._WHERE_WORDS | cls._WORK_WORDS | cls._HOME_WORDS
-                | cls._PEOPLE_WORDS | names | set(_ROLE_WORDS) | {"keeper", "tender", "occupancy"}
+                | cls._PEOPLE_WORDS | names | set(_ROLE_WORDS) | _STATE_WORDS | {"keeper", "tender", "occupancy"}
             )
         words = set(re.findall(r"[a-z]+", choice))
         for word in list(words):
@@ -830,6 +843,14 @@ class Conversation:
             return "end", None
         place = next((key for key, (names, _, _) in _PLACES.items() if words & names), None)
         role = cls._role_named(words)
+        # "Is the lantern by the inn lit?": the first place named with a state is what's asked about,
+        # any other place named is a landmark that picks out which one
+        if place is not None and words & _STATE_WORDS:
+            ordered = [key for token in re.findall(r"[a-z]+", choice) for key, (names, _, _) in _PLACES.items() if token in names]
+            ordered += [key for key, (names, _, _) in _PLACES.items() if words & names and key not in ordered]
+            asked = next((key for key in dict.fromkeys(ordered) if key in _STATE_TYPES), ordered[0])
+            landmark = next((key for key in dict.fromkeys(ordered) if key != asked), None)
+            return "state", (asked, landmark)
         # A request: our home or our work, or somewhere else (answered by who to ask instead)
         if words & cls._REQUEST_VERBS:
             if words & cls._HOME_WORDS:
@@ -2362,15 +2383,78 @@ class Agent:
             return f"That's me! I work at {_WORKPLACE_NAMES[role]}. Say 3 and I'll show you."
         several = _ROLE_ORDER.count(role) > 1
         name = role.replace("_", " ") + ("s" if several else "")
-        line = f"The {name} {'work' if several else 'works'} at {_WORKPLACE_NAMES[role]}."
+        line = f"The {name} {'work' if several else 'works'} at {_WORKPLACE_NAMES[role]}. I'm not sure where they are right now"
         phase = _phase_at_tick(tick)
         if phase == "night" and role != "lighter":
-            return f"{line} At this hour they're most likely asleep at home."
+            return f"{line}, but at this hour they're most likely asleep at home."
         if phase == "evening":
-            return f"{line} In the evening, though, most of us are at the inn."
+            return f"{line}, but in the evening most of us are at the inn."
         if role == "lighter" and phase == "morning":
-            return f"{line} They sleep through the morning, though."
-        return f"{line} I'm not sure where they are right now."
+            return f"{line}, but they sleep through the morning."
+        return f"{line}."
+
+    def _landmark_point(self, place: str):
+        """Where a named landmark is, to pick out "the lantern by the inn": a building's doorway, or
+        the nearest prop of that kind."""
+        observation = self._latest
+        if place in ("inn", "shed"):
+            building = next((item for item in layout.buildings(observation) if item["type"] == place), None)
+            return layout.doorway(observation, building["id"]) if building is not None else None
+        here = me.position(observation)
+        matching = [prop for prop in props.all(observation) if prop["type"] == place]
+        return min((_prop_centre(prop) for prop in matching), key=lambda point: geometry.distance(here, point), default=None)
+
+    def _state_answer(self, asked: str, landmark: str | None) -> str:
+        """Is it lit / open / tended? Answered from what this villager can see right now (observed
+        knowledge); out of view it says so, and adds what it remembers seeing (memorized knowledge,
+        which may be out of date). The bell is heard, not seen, so everyone knows if it's ringing."""
+        observation = self._latest
+        prop_type = _STATE_TYPES.get(asked)
+        if prop_type is None:  # a place with no state to look at: the inn, the shed, the board
+            if asked == "inn":
+                return "The inn's always open. Everyone heads there in the evening."
+            return f"I'm not sure. Ask {self._someone_who(_PLACES[asked][2])}, they work there."
+        if prop_type == "bell":
+            return "Yes, the bell is ringing!" if day.bell_ringing(observation) else "No, the bell is quiet right now."
+        one = prop_type.replace("_", " ")
+        many = _PLURALS.get(prop_type, one + "s")
+        seen = {entry["prop"]: entry["state"] for entry in props.seen(observation)}
+        matching = [prop for prop in props.all(observation) if prop["type"] == prop_type]
+        if not matching:
+            return f"I don't think we have any {many} here."
+        tick = day.tick(observation)
+
+        def remembered(prop_ids) -> str:
+            known = [(self.prop_memory[prop_id][1], self.prop_memory[prop_id][0]) for prop_id in prop_ids if prop_id in self.prop_memory]
+            if not known:
+                return ""
+            when, state = max(known)
+            ago = tick - when
+            said = "just now" if ago < 60 else "a little while ago" if ago < 300 else "earlier today"
+            return f" When I last saw it, {said}, it was {state}." if len(prop_ids) == 1 else f" The last one I saw, {said}, was {state}."
+
+        if landmark is not None:
+            point = self._landmark_point(landmark)
+            if point is not None:
+                prop = min(matching, key=lambda item: geometry.distance(point, _prop_centre(item)))
+                where = f"the {one} by {_PLACES[landmark][1]}"
+                if prop["id"] in seen:
+                    return f"{where.capitalize()} is {seen[prop['id']]} right now."
+                return f"I can't see {where} from here.{remembered([prop['id']])}"
+        visible = [prop for prop in matching if prop["id"] in seen]
+        if len(matching) == 1:  # the only one in the village (the hearth, say)
+            if visible:
+                return f"The {one} is {seen[visible[0]['id']]} right now."
+            return f"I can't see the {one} from here.{remembered([matching[0]['id']])}"
+        if len(visible) == 1:
+            return f"The {one} I can see is {seen[visible[0]['id']]} right now."
+        if visible:
+            counts = {}
+            for prop in visible:
+                counts[seen[prop["id"]]] = counts.get(seen[prop["id"]], 0) + 1
+            listed = ", ".join(f"{count} {state}" for state, count in counts.items())
+            return f"I can see {len(visible)} {many} from here: {listed}."
+        return f"I can't see any {many} from here.{remembered([prop['id'] for prop in matching])}"
 
     def _answer(self, intent: str, tick: int, about=None) -> str:
         """The reply to a question or a menu choice (requests go through _accept_request). ``about``
@@ -2412,6 +2496,8 @@ class Agent:
             return _fit(f"My family? {self._where_role(_role_of(family[0]), tick)}", _MENU)
         if intent == "where_unknown":
             return _fit("I'm not sure.", _MENU)
+        if intent == "state":
+            return _fit(self._state_answer(*about), _MENU)
         if intent == "end":
             if self.request is not None:
                 self._end_request(None)
